@@ -1,0 +1,171 @@
+#!/bin/bash
+HELP="
+################################################################################
+# FILE:		generic
+# SYNOPSIS:	Find value in hosts, master seedfile, Smarts, Clarify, and
+#		check for SNMP and ICMP response
+# USAGE:	generic NameOrIP CommString
+# OPTION:	generic -4digit NameOrIP CommString
+#		For single-tennant Smarts use device name with no 4-digit, or IP
+#		For multi-tennant Smarts use device name with 4-digit, device
+#		name without 4-digit using the switch option, or IP
+# AUTHOR:	Chris Cook
+# LAST MOD DATE:09/27/2015
+# MODIFIED BY:	Andrew Brown
+# VERSION:      1.2.3 - Accounts for a Failover implementation
+#		1.2.2 - checks the master_seedfile_CN-AMPM0-99.txt
+#		1.2.1 - strips like the parser
+#               1.2 - real-time Clarify checking
+################################################################################\n"
+
+# Process no input
+if [ -z "$1" ]; then echo -e "$HELP\007"; exit 0; fi
+
+# Set environment variables
+. /smarts/etc/SMARTS_ENV
+. ~ora_atg/instantclient_10_2/envfile
+export GREP_OPTIONS='--color=never'
+
+# Predefine variables
+#dmctl -s 5074-AMPM01 get ICF_TopologyManager::ICF-TopologyManager::defaultReadCommunity
+COMM=`grep ^defaultReadCommunity $IP_DIR/local/conf/discovery/discovery.conf | awk -F'"' '{print $2}'` # Get Smarts' default Comm String
+if [[ $1 == -* ]]; then # Process optional customer 4-digit
+        DDDD=`echo $1 | awk -F'-' '{print $2}'`
+        NODE=$2
+        CS=${3:-$COMM} # set $CS to default community if not provided
+else
+	NODE=$1
+	CS=${2:-$COMM} # set $CS to default community if not provided
+fi
+fNODE=`echo $NODE | sed 's:\.:\\\&:g'` # fixes NODE to escape periods, helps with grep
+HOSTNAME=`hostname | awk -F'.' '{print $1}'`
+CHECK="/smartsxfr/bin/clarcheck.pl"
+
+# Process provided input
+clear
+tput sgr0
+echo
+echo -e '\E[0;36m'"Looking for $NODE...\e[0m"
+
+# --------------- HOSTS ---------------
+echo
+echo -e '\E[0;36m'" :: $NODE in hosts file ::\e[0m"
+HOST=`egrep -i "^$fNODE[[:space:]]|[[:space:]]$fNODE[[:space:]]|[[:space:]]${fNODE}$" /etc/hosts` # find fixed criteria in hosts file
+if [ -z "$HOST" ]; then # is criteria in hosts file?
+	echo -e '\E[0;31m'"$NODE not found\e[0m"
+	NAME="NotFound"
+else
+	echo "$HOST" | grep --color=always -i $fNODE 
+	NAME=`echo "$HOST" | awk 'NR==1{print $2}'` # get $NAME from hosts file
+fi
+
+# --------------- MASTER SEED ---------------
+echo
+echo -e '\E[0;36m'" :: $NODE in master seedfile ::\e[0m"
+SEED=`egrep -i "^$fNODE[[:space:]]|\=$fNODE[[:space:]]|\=${fNODE}$" /smarts/seedfiles/master_seedfile_*-AMPM[0-9][0-9].txt` # find fixed criteria in master seed
+if [ -z "$SEED" ]; then # is criteria in master seed?
+	echo -e '\E[0;31m'"$NODE not found\e[0m"
+else
+	echo "$SEED" | grep --color=always -i $fNODE
+fi
+
+# --------------- SMARTS ---------------
+echo 
+AMPM=`brcontrol | awk  '{print$1}' | grep -i 'AMPM'` # get the poller
+CUST=`echo $AMPM | awk -F'-' '{print $1}'` # get customer number
+echo -e '\E[0;36m'" :: $NODE in Smarts [$CUST] ::\e[0m"
+
+Smarts () {
+sSTAMP=`stat -c %z /smarts/log/CURRENT_${AMPM} | awk -F'.' '{print $1}'` # get time of last change
+TYPE=`egrep -i "[[:space:]]$NAME[[:space:]]|[[:space:]]$fNODE[[:space:]]" /smarts/log/CURRENT_${AMPM} | awk -F' & ' '{print $1}' | uniq` # find fixed criteria type
+DisplayName=`dmctl -s $AMPM findInstances $TYPE::$NAME`
+if [ -z "$DisplayName" ]; then 
+	echo "$NODE is not currently monitored, but it is in the ${AMPM} log as a $TYPE as of $sSTAMP ";
+else
+        echo "$NAME is in the ${AMPM} log as a $TYPE as of $sSTAMP"
+	echo "       DisplayName = `dmctl -s $AMPM get $TYPE::$NAME::DisplayName`"
+	echo "       SNMPAddress = `dmctl -s $AMPM get $TYPE::$NAME::SNMPAddress`"
+	echo " DiscoveredFirstAt = `dmctl -s $AMPM get $TYPE::$NAME::DiscoveredFirstAt`"
+	echo "  DiscoveredLastAt = `dmctl -s $AMPM get $TYPE::$NAME::DiscoveredLastAt`"
+	AMOD="`dmctl -s $AMPM get $TYPE::$NAME::AccessMode`" # gets AccessMode for later
+fi
+}
+
+Nopes () {
+        echo -e '\E[0;31m'"$NODE not found in the most current log"
+	echo -e '\E[0m'"You'll need to check Smarts manually"
+}
+
+[[ -n $AMPM ]] && Smarts || Nopes
+
+# --------------- CLARIFY ---------------
+echo
+[[ -z $DDDD ]] && DDDD=`echo $HOSTNAME | sed 's/.*s//' | sed 's/[[:alpha:]]*$//'` # if no 4-digit was provided, make it something
+
+ClarifyNAME () {
+if [[ $DDDD != [0-9][0-9][0-9][0-9] ]]; then # if $DDDD isn't actually 4 numbers
+	if [[ $NODE == *_[0-9][0-9][0-9][0-9] ]]; then # then maybe the entered string has the 4-digit
+		DDDD=`echo $NODE | awk -F'_' '{print $NF}'` # keeps last 4 numbers
+		cNAME=`echo $NODE | sed 's/_[0-9][0-9][0-9][0-9]$//'` # strips last 4 numbers
+		echo -e '\E[0;36m'" :: $NODE in Clarify [$DDDD]::\e[0m"
+		perl $CHECK $DDDD $cNAME
+	else
+		echo -e '\E[0;36m'" :: $NODE in Clarify [$DDDD]::\e[0m"
+		echo -e '\E[0;31m'"Unable to determine customer 4-digit from search criteria or server hostname.\e[0m"
+		echo "Type just \"generic\" for help\\usage."
+	fi
+else
+	echo -e '\E[0;36m'" :: $NODE in Clarify [$DDDD]::\e[0m"
+	perl $CHECK $DDDD ${NODE/\.*/}
+fi
+}
+ClarifyIP () {
+if [ $NAME != "NotFound" ]; then # if a name is found in hosts
+	if [[ $DDDD != [0-9][0-9][0-9][0-9] ]]; then # if $DDDD isn't actually 4 numbers
+		if [[ $NAME == *_[0-9][0-9][0-9][0-9] ]]; then # then maybe the entered string has the 4-digit
+			DDDD=`echo $NAME | awk -F'_' '{print $NF}'` # keeps last 4 numbers
+			cNAME=`echo $NAME | sed 's/_[0-9][0-9][0-9][0-9]$//'` # strips last 4 numbers
+			echo -e '\E[0;36m'" :: $cNAME in Clarify [$DDDD]::\e[0m"
+			perl $CHECK $DDDD $cNAME
+		else
+			echo -e '\E[0;36m'" :: $NODE in Clarify [$DDDD]::\e[0m"
+			echo -e '\E[0;31m'"Unable to determine search criteria.\e[0m"
+			echo "Type just \"generic\" for help\\usage."
+		fi
+	else
+		echo -e '\E[0;36m'" :: $NAME in Clarify [$DDDD]::\e[0m"
+		perl $CHECK $DDDD $NAME # then use the hosts file name $2
+	fi
+else
+	echo -e '\E[0;36m'" :: $NODE in Clarify [$DDDD]::\e[0m"
+	echo -e '\E[0;31m'"Unable to query Clarify by IP, try again with a name\e[0m"
+	echo "Type just \"generic\" for help\\usage."
+fi
+}
+Clarify () {
+if [[ $NODE == `echo $NODE | egrep '([[:digit:]]{1,3}\.){3}[[:digit:]]{1,3}'` ]]; then # if user is searching with an IP
+	ClarifyIP # runs if IP
+else
+	ClarifyNAME # runs if not IP
+fi
+}
+if [[ -e "$CHECK" ]]; then
+	 Clarify
+else 
+	echo -e '\E[0;36m'" :: $NODE in Clarify ::\e[0m\nClarify dependency missing $CHECK"
+fi
+
+# --------------- SNMP ---------------
+echo
+echo -e '\E[0;36m'" :: $NODE SNMP response ::\e[0m"
+if [ -z "$2" ]; then # was a CommString provided?
+	echo -e '\E[0;35m'"CommString not provided, let's try the Smarts default: $COMM\e[0m"
+fi
+[[ "$AMOD" == "ICMPONLY" ]] && echo -e "$NODE is monitored as \E[0;31m$AMOD\E[0m" || snmpget -O Q -r 1 -t 2 -v 2c -c $CS $NODE sysName.0
+
+# --------------- ICMP ---------------
+echo
+echo -e '\E[0;36m'" :: $NODE ICMP response ::\e[0m"
+ping -c 2 $NODE
+echo
+echo -e "\007"
